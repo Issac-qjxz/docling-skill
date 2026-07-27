@@ -21,33 +21,41 @@ While Claude Code can read many file types natively, complex documents (academic
 
 ### Prerequisites
 
-| Dependency | Version | Installation |
-|------------|---------|--------------|
-| Python | >= 3.10 | [python.org](https://www.python.org/downloads/) |
-| Claude Code | Latest | `npm install -g @anthropic-ai/claude-code` |
-| Docling | >= 2.0 | `pip install docling` |
+| Dependency | Version | Note |
+|------------|---------|------|
+| Python | >= 3.10 | Required by Docling |
+| Claude Code | Latest | Terminal AI assistant |
+| Docling | >= 2.0 | Document parsing engine |
+
+> **The skill assumes these are already installed.** If `docling` is not found at runtime, the skill will prompt you to install it — it will NOT install automatically without your consent.
 
 > **Mirror fallback (China mainland)**: `pip install docling -i https://pypi.tuna.tsinghua.edu.cn/simple`
 
 ### Installation
 
-1. **Install Docling**:
-
-```bash
-pip install docling
-```
-
-2. **Copy the skill file** to your Claude Code skills directory:
+1. **Copy the skill directory** to your Claude Code skills directory:
 
 ```bash
 # Linux / macOS
+mkdir -p ~/.claude/skills/docling
 cp SKILL.md ~/.claude/skills/docling/SKILL.md
+cp -r scripts/ ~/.claude/skills/docling/scripts/
 
 # Windows (PowerShell)
+New-Item -ItemType Directory -Force $env:USERPROFILE\.claude\skills\docling
 Copy-Item SKILL.md $env:USERPROFILE\.claude\skills\docling\SKILL.md
+Copy-Item -Recurse scripts/ $env:USERPROFILE\.claude\skills\docling\scripts/
+```
+
+2. **Install pypdf** (required by detection scripts):
+
+```bash
+pip install pypdf -i https://pypi.tuna.tsinghua.edu.cn/simple
 ```
 
 3. **Restart Claude Code** (or start a new session). The skill is auto-detected.
+
+4. **First use**: Docling will auto-download model artifacts (~550MB) on first run. No manual setup needed.
 
 ### Usage
 
@@ -120,6 +128,103 @@ User: /Docling Convert "thesis.pdf" to markdown
        thesis.md generated
 ```
 
+### Scripts
+
+The skill includes pre-built Python scripts for common operations:
+
+```
+scripts/
+├── detect_pdf_type.py      # PDF deep analysis (type/language/recommended flags)
+├── convert_single.py       # Single file converter (pure executor, no auto-detection)
+├── convert_batch.py        # Batch sequential conversion
+└── utils.py                # Shared utilities
+```
+
+#### `detect_pdf_type.py` — PDF Deep Analysis
+
+Analyzes PDF structure before conversion to select optimal parameters.
+
+```bash
+# Plain text output
+python scripts/detect_pdf_type.py input.pdf
+
+# JSON output
+python scripts/detect_pdf_type.py input.pdf --json
+```
+
+Output fields:
+
+| Field | Description |
+|-------|-------------|
+| `type` | vector_text / scanned / mixed / academic / form / encrypted / unknown |
+| `has_text_layer` | Whether extractable text exists |
+| `has_images` | Whether images are present |
+| `has_formulas` | Whether LaTeX formulas detected |
+| `page_count` | Total pages |
+| `encrypted` | Whether PDF is encrypted |
+| `form_fields` | Whether form fields exist |
+| `lang` | zh / en |
+| `lang_confidence` | Chinese character ratio (0-1) |
+| `recommended_flags` | Suggested docling CLI flags |
+
+#### `convert_single.py` — Single File Converter
+
+Pure executor: receives parameters, runs docling, returns result. No auto-detection.
+
+```bash
+python scripts/convert_single.py input.pdf --to md --output ./out/
+python scripts/convert_single.py input.pdf --to json --no-ocr --tables
+```
+
+#### `convert_batch.py` — Batch Sequential Converter
+
+Converts all matching files in a directory sequentially. Parallel execution is handled by Claude Code Agent.
+
+```bash
+python scripts/convert_batch.py ./docs/ --to md --output ./out/
+python scripts/convert_batch.py ./docs/ --to md --output ./out/ --ext pdf,docx
+```
+
+### PDF Analysis Workflow
+
+When you invoke `/Docling` with a PDF file, the skill automatically:
+
+1. **Detects PDF type** (vector/scanned/mixed/academic/form/encrypted)
+2. **Identifies language** (Chinese/English) by sampling text
+3. **Recommends optimal flags** based on analysis
+4. **Executes conversion** with the right parameters
+
+```
+User: /Docling Convert "paper.pdf" to markdown
+         │
+         ▼
+┌─────────────────────────────────┐
+│  detect_pdf_type.py analyzes    │
+│  → type: vector_text            │
+│  → lang: en                     │
+│  → recommended: --no-ocr        │
+└─────────────┬───────────────────┘
+              │
+              ▼
+┌─────────────────────────────────┐
+│  convert_single.py executes     │
+│  docling paper.pdf --to md      │
+│  --no-ocr --tables              │
+└─────────────┬───────────────────┘
+              │
+              ▼
+       paper.md generated
+```
+
+### Format Analysis Coverage
+
+| Format | Analysis Level | Details |
+|--------|---------------|---------|
+| **PDF** | **Full depth** | Detects vector text, scanned, mixed, academic, form, encrypted. Identifies language (zh/en). Auto-selects optimal conversion parameters. |
+| **DOCX, PPTX, HTML, images, audio, video, etc.** | **Basic** | Supported for conversion, but no pre-conversion analysis. Uses default parameters. User may manually specify flags. |
+
+> This skill is currently **PDF expert level**. Other formats work well with default settings but lack intelligent pre-analysis. Contributions welcome.
+
 ### Advanced Options
 
 #### PDF Processing
@@ -169,11 +274,29 @@ docling video.mp4 --video-diarization
 
 #### Batch Processing
 
+When converting multiple files, the skill presents three execution strategies:
+
+| Strategy | Description | Best For |
+|----------|-------------|----------|
+| **Sequential** | One file at a time, single script | < 10 files, precise control, unified log |
+| **Parallel Agents** | Multiple files concurrently via Claude Code agents | >= 10 files, no inter-file dependencies, maximum speed |
+| **Custom Batching** | User-defined groups, each group uses sequential or parallel | Mixed formats, large files need isolation, or custom logic |
+
+The skill will ask you to choose when it detects multiple input files:
+
+```
+检测到批量转换任务（15 个文件），请选择执行策略：
+
+A. 顺序执行（单脚本）— 逐个转换，稳定可靠
+B. 并行执行（多 Agent）— 同时处理，速度最快
+C. 自定义分批 — 按你的规则分组执行
+```
+
 ```bash
-# Convert entire directory
+# You can also use Docling's built-in directory conversion:
 docling ./documents/ --to md --output ./converted/
 
-# Convert from URL
+# Or convert from URL:
 docling https://arxiv.org/pdf/2206.01062
 ```
 
@@ -197,11 +320,19 @@ First run downloads models from HuggingFace. Subsequent runs use local cache.
 
 | Issue | Solution |
 |-------|----------|
-| `docling: command not found` | Ensure Python Scripts dir is in PATH, or use `python -m docling` |
+| `docling: command not found` | Skill will prompt to install. Or manually: `pip install docling -i https://pypi.tuna.tsinghua.edu.cn/simple` |
 | HuggingFace symlink warning (Windows) | Cosmetic only. Set `HF_HUB_DISABLE_SYMLINKS_WARNING=1` to suppress |
 | Slow conversion | First run downloads ~550MB models. After caching, vector PDFs convert in seconds |
 | OCR quality poor | Try `--force-ocr` or `--ocr-engine tesseract` for different results |
 | Memory errors on large PDFs | Process in smaller batches, or use `--no-tables` to reduce memory usage |
+| Want parallel batch conversion | Specify multiple files when invoking `/Docling` — the skill offers sequential, parallel agent, or custom strategies |
+| Chinese filename PDF fails on Windows | Docling bug: temp file permission error with CJK paths. Workaround: rename file to ASCII-only name before converting |
+
+### Known Limitations
+
+- **Docling + Windows + Chinese paths**: Docling has a known issue with temporary file handling when file paths contain CJK characters. Conversion may fail with `PermissionError`. Workaround: rename files to ASCII-only names before converting.
+- **Form PDF language detection**: Form-type PDFs without text layers default to `lang: en`. If the document is actually Chinese, the skill will still work but may not add `--ocr-lang zh,en` automatically.
+- **Formula detection**: Uses regex matching for LaTeX patterns. May miss formulas in non-LaTeX formats (e.g., images of equations).
 
 ### License
 
@@ -231,33 +362,41 @@ Claude Code 原生支持读取多种文件类型，但复杂文档（含公式�
 
 ### 环境要求
 
-| 依赖 | 版本 | 安装方式 |
-|------|------|----------|
-| Python | >= 3.10 | [python.org](https://www.python.org/downloads/) |
-| Claude Code | 最新版 | `npm install -g @anthropic-ai/claude-code` |
-| Docling | >= 2.0 | `pip install docling` |
+| 依赖 | 版本 | 说明 |
+|------|------|------|
+| Python | >= 3.10 | Docling 运行依赖 |
+| Claude Code | 最新版 | 终端 AI 助手 |
+| Docling | >= 2.0 | 文档解析引擎 |
+
+> **技能默认假设这些已安装。** 若运行时未检测到 `docling`，会提示你是否安装 — 不会在未经同意的情况下自动安装。
 
 > **国内镜像兜底**：`pip install docling -i https://pypi.tuna.tsinghua.edu.cn/simple`
 
 ### 安装步骤
 
-1. **安装 Docling**：
-
-```bash
-pip install docling
-```
-
-2. **复制技能文件**到 Claude Code 技能目录：
+1. **复制技能目录**到 Claude Code 技能目录：
 
 ```bash
 # Linux / macOS
+mkdir -p ~/.claude/skills/docling
 cp SKILL.md ~/.claude/skills/docling/SKILL.md
+cp -r scripts/ ~/.claude/skills/docling/scripts/
 
 # Windows (PowerShell)
+New-Item -ItemType Directory -Force $env:USERPROFILE\.claude\skills\docling
 Copy-Item SKILL.md $env:USERPROFILE\.claude\skills\docling\SKILL.md
+Copy-Item -Recurse scripts/ $env:USERPROFILE\.claude\skills\docling\scripts\
+```
+
+2. **安装 pypdf**（检测脚本依赖）：
+
+```bash
+pip install pypdf -i https://pypi.tuna.tsinghua.edu.cn/simple
 ```
 
 3. **重启 Claude Code**（或开启新会话），技能自动加载。
+
+4. **首次使用**：Docling 会在首次运行时自动下载模型文件（~550MB），无需手动配置。
 
 ### 使用方式
 
@@ -330,6 +469,103 @@ Copy-Item SKILL.md $env:USERPROFILE\.claude\skills\docling\SKILL.md
        生成 thesis.md
 ```
 
+### 预存脚本
+
+技能内置 Python 脚本，覆盖常见操作场景，避免重复造轮子：
+
+```
+scripts/
+├── detect_pdf_type.py      # PDF 深度分析（类型/语言/推荐参数）
+├── convert_single.py       # 单文件转换（纯执行器）
+├── convert_batch.py        # 批量顺序转换
+└── utils.py                # 共用工具函数
+```
+
+#### `detect_pdf_type.py` — PDF 深度分析
+
+在转换前分析 PDF 结构，自动选择最优参数。
+
+```bash
+# 纯文本输出
+python scripts/detect_pdf_type.py input.pdf
+
+# JSON 输出
+python scripts/detect_pdf_type.py input.pdf --json
+```
+
+输出字段：
+
+| 字段 | 说明 |
+|------|------|
+| `type` | vector_text / scanned / mixed / academic / form / encrypted / unknown |
+| `has_text_layer` | 是否有可提取的文本层 |
+| `has_images` | 是否包含图片 |
+| `has_formulas` | 是否包含 LaTeX 公式 |
+| `page_count` | 总页数 |
+| `encrypted` | 是否加密 |
+| `form_fields` | 是否包含表单字段 |
+| `lang` | zh / en |
+| `lang_confidence` | 中文字符占比（0-1） |
+| `recommended_flags` | 推荐的 docling CLI 参数 |
+
+#### `convert_single.py` — 单文件转换
+
+纯执行器：接收参数，调用 docling，返回结果。不做自动检测。
+
+```bash
+python scripts/convert_single.py input.pdf --to md --output ./out/
+python scripts/convert_single.py input.pdf --to json --no-ocr --tables
+```
+
+#### `convert_batch.py` — 批量顺序转换
+
+遍历目录，按扩展名过滤，顺序执行转换。并行由 SKILL.md 调度 Agent 实现。
+
+```bash
+python scripts/convert_batch.py ./docs/ --to md --output ./out/
+python scripts/convert_batch.py ./docs/ --to md --output ./out/ --ext pdf,docx
+```
+
+### PDF 分析工作流
+
+使用 `/Docling` 处理 PDF 时，技能会自动：
+
+1. **检测 PDF 类型**（矢量/扫描/混合/学术/表单/加密）
+2. **识别语言**（中文/英文）通过采样文本
+3. **推荐最优参数**基于分析结果
+4. **执行转换**使用正确的参数
+
+```
+用户: /Docling 将 "paper.pdf" 转为 markdown
+         │
+         ▼
+┌─────────────────────────────────┐
+│  detect_pdf_type.py 分析        │
+│  → type: vector_text            │
+│  → lang: en                     │
+│  → recommended: --no-ocr        │
+└─────────────┬───────────────────┘
+              │
+              ▼
+┌─────────────────────────────────┐
+│  convert_single.py 执行         │
+│  docling paper.pdf --to md      │
+│  --no-ocr --tables              │
+└─────────────┬───────────────────┘
+              │
+              ▼
+       生成 paper.md
+```
+
+### 格式分析覆盖范围
+
+| 格式 | 分析深度 | 说明 |
+|------|---------|------|
+| **PDF** | **专家级** | 检测矢量文字、扫描件、混合型、学术论文、表单、加密。识别中英文。自动选择最优转换参数。 |
+| **DOCX、PPTX、HTML、图片、音视频等** | **基础** | 支持转换，但无预分析。使用默认参数。用户可手动指定参数。 |
+
+> 本技能目前**对 PDF 达到专家级**。其他格式使用默认参数即可正常转换，但缺少智能预分析。欢迎贡献。
+
 ### 高级选项
 
 #### PDF 处理
@@ -379,11 +615,29 @@ docling video.mp4 --video-diarization
 
 #### 批量处理
 
+转换多个文件时，技能会提供三种执行策略供选择：
+
+| 策略 | 说明 | 适用场景 |
+|------|------|----------|
+| **顺序执行** | 单脚本逐个转换 | 文件少（<10）、需要精确控制、统一日志 |
+| **并行执行** | 多 Agent 同时处理 | 文件多（>=10）、文件间无依赖、追求速度 |
+| **自定义分批** | 用户指定分组方式和每组策略 | 混合格式、大文件需隔离、或有特殊逻辑 |
+
+当检测到多个输入文件时，技能会询问：
+
+```
+检测到批量转换任务（15 个文件），请选择执行策略：
+
+A. 顺序执行（单脚本）— 逐个转换，稳定可靠
+B. 并行执行（多 Agent）— 同时处理，速度最快
+C. 自定义分批 — 按你的规则分组执行
+```
+
 ```bash
-# 转换整个目录
+# 也可以直接使用 Docling 内置的目录转换：
 docling ./documents/ --to md --output ./converted/
 
-# 从 URL 转换
+# 或从 URL 转换：
 docling https://arxiv.org/pdf/2206.01062
 ```
 
@@ -407,11 +661,19 @@ Docling **不使用大语言模型**。其管线由以下组件构成：
 
 | 问题 | 解决方案 |
 |------|----------|
-| `docling: command not found` | 确认 Python Scripts 目录在 PATH 中，或使用 `python -m docling` |
+| `docling: command not found` | 技能会提示是否安装。也可手动：`pip install docling -i https://pypi.tuna.tsinghua.edu.cn/simple` |
 | HuggingFace symlink 警告（Windows） | 仅影响显示。设置 `HF_HUB_DISABLE_SYMLINKS_WARNING=1` 抑制 |
 | 转换速度慢 | 首次运行需下载 ~550MB 模型。缓存后矢量 PDF 秒级完成 |
 | OCR 效果差 | 尝试 `--force-ocr` 或 `--ocr-engine tesseract` |
 | 大文件内存不足 | 分批处理，或使用 `--no-tables` 减少内存占用 |
+| 批量转换想并行 | 触发 `/Docling` 时说明多个文件，技能会提供顺序/并行/自定义三种策略 |
+| Windows 中文文件名 PDF 失败 | Docling 已知 bug：中文路径临时文件权限错误。解决：将文件重命名为纯英文后再转换 |
+
+### 已知限制
+
+- **Docling + Windows + 中文路径**：Docling 在处理包含中文字符的文件路径时，临时文件清理会报 `PermissionError`。解决：将文件重命名为纯英文。
+- **表单 PDF 语言检测**：无文本层的表单 PDF 默认返回 `lang: en`。如果实际是中文文档，技能仍可工作，但可能不会自动加 `--ocr-lang zh,en`。
+- **公式检测**：使用正则匹配 LaTeX 模式，可能遗漏非 LaTeX 格式的公式（如图片中的公式）。
 
 ### 许可证
 
