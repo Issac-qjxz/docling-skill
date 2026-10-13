@@ -1,185 +1,191 @@
-"""
-Docling Skill - 单文件转换脚本
-纯执行器：接收参数，调用 docling 转换，返回结果。
-不做任何自动检测，完全信任调用者传入的参数。
-
-用法:
-    python convert_single.py input.pdf --to md --output ./out/
-    python convert_single.py input.pdf --to json --no-ocr --tables
-    python convert_single.py input.pdf --to md --force-ocr --ocr-lang zh,en
-"""
-
+"""单 PDF 完整转换流程；独立输出目录、结构验证与可审计结果。不使用随机抽样。"""
 import argparse
+import copy
+import importlib.metadata
+import json
+import os
+import re
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
+from detect_pdf_type import detect_pdf_type
+from utils import verify_file, verify_dir, format_output
 
-from utils import verify_file, verify_dir, print_result
+EXTENSIONS = {'md': '.md', 'json': '.json', 'yaml': '.yaml', 'html': '.html',
+              'html_split_page': '.html', 'text': '.txt', 'doctags': '.doctags',
+              'doclang': '.dclg.xml', 'chunks': '.chunks.jsonl'}
 
 
 def build_docling_cmd(input_file: Path, args) -> list:
-    """
-    构建 docling CLI 命令。
-
-    Args:
-        input_file: 输入文件路径
-        args: argparse 解析后的参数
-
-    Returns:
-        list: 命令列表
-    """
-    cmd = ['docling', str(input_file)]
-
-    # 输出格式
-    if args.to:
-        cmd.extend(['--to', args.to])
-
-    # 输出目录
-    if args.output:
-        cmd.extend(['--output', str(args.output)])
-
-    # 输入格式
-    if getattr(args, 'from_fmt', None):
-        cmd.extend(['--from', args.from_fmt])
-
-    # PDF 相关
-    if args.no_ocr:
-        cmd.append('--no-ocr')
-    if args.force_ocr:
-        cmd.append('--force-ocr')
-    if args.tables:
-        cmd.append('--tables')
-    if args.no_tables:
-        cmd.append('--no-tables')
-    if args.enrich_formula:
-        cmd.append('--enrich-formula')
-    if args.enrich_code:
-        cmd.append('--enrich-code')
-    if args.enrich_chart_data:
-        cmd.append('--enrich-chart-data')
-    if args.ocr_lang:
-        cmd.extend(['--ocr-lang', args.ocr_lang])
-    if args.ocr_engine:
-        cmd.extend(['--ocr-engine', args.ocr_engine])
-    if args.pdf_password:
-        cmd.extend(['--pdf-password', args.pdf_password])
-    if args.table_mode:
-        cmd.extend(['--table-mode', args.table_mode])
-
-    # VLM 管线
-    if args.pipeline:
-        cmd.extend(['--pipeline', args.pipeline])
-    if args.vlm_model:
-        cmd.extend(['--vlm-model', args.vlm_model])
-
+    if args.no_ocr and args.force_ocr:
+        raise ValueError('--no-ocr 与 --force-ocr 不能同时使用。')
+    if args.tables and args.no_tables:
+        raise ValueError('--tables 与 --no-tables 不能同时使用。')
+    if args.to not in EXTENSIONS:
+        raise ValueError('不支持该 PDF 输出格式。')
+    engine = getattr(args, 'ocr_engine', None) or 'auto'
+    if getattr(args, 'ocr_lang', None) and engine == 'auto':
+        raise ValueError('指定 --ocr-lang 时也必须指定 --ocr-engine，语言代码因引擎而异。')
+    output = Path(args.output).resolve() if args.output else input_file.parent.resolve()
+    cmd = [sys.executable, '-X', 'utf8', '-m', 'docling.cli.main', 'convert', str(input_file),
+           '--from', 'pdf', '--pipeline', 'standard', '--to', args.to,
+           '--output', str(output), '--abort-on-error', '--image-export-mode', 'embedded']
+    if args.to != 'json':
+        cmd.extend(['--to', 'json'])  # 始终导出结构副本，用于页数和内容验证。
+    for enabled, flag in [(args.no_ocr, '--no-ocr'), (args.force_ocr, '--force-ocr'),
+                          (args.tables, '--tables'), (args.no_tables, '--no-tables'),
+                          (args.enrich_formula, '--enrich-formula'),
+                          (args.enrich_code, '--enrich-code'),
+                          (getattr(args, 'enrich_chart_data', False), '--enrich-chart-extraction')]:
+        if enabled:
+            cmd.append(flag)
+    cmd.extend(['--ocr-engine', engine])
+    for name, flag in [('ocr_lang', '--ocr-lang'), ('pdf_password', '--pdf-password'),
+                       ('table_mode', '--table-mode')]:
+        value = getattr(args, name, None)
+        if value:
+            cmd.extend([flag, value])
     return cmd
 
 
-def run_conversion(input_file: Path, args) -> tuple:
-    """
-    执行单文件转换。
-
-    Returns:
-        (success: bool, output_path: str|None, error: str|None, elapsed: float)
-    """
-    cmd = build_docling_cmd(input_file, args)
-
-    start = time.time()
-    try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            encoding='utf-8',
-            errors='replace',
-            timeout=600  # 10 分钟超时
-        )
-        elapsed = time.time() - start
-
-        if result.returncode == 0:
-            # 从输出中提取生成的文件路径
-            output_path = _extract_output_path(input_file, args)
-            return True, output_path, None, elapsed
-        else:
-            stderr = result.stderr.strip() if result.stderr else ""
-            stdout = result.stdout.strip() if result.stdout else ""
-            error = stderr or stdout or f"exit code {result.returncode}"
-            # 截断过长的错误信息
-            if len(error) > 500:
-                error = error[:500] + "..."
-            return False, None, error, elapsed
-
-    except subprocess.TimeoutExpired:
-        elapsed = time.time() - start
-        return False, None, "Conversion timed out (600s)", elapsed
-    except FileNotFoundError:
-        elapsed = time.time() - start
-        return False, None, "docling command not found. Is Docling installed?", elapsed
-    except Exception as e:
-        elapsed = time.time() - start
-        return False, None, str(e), elapsed
-
-
 def _extract_output_path(input_file: Path, args) -> str:
-    """推断输出文件路径。"""
-    output_dir = Path(args.output) if args.output else input_file.parent
-    ext_map = {
-        'md': '.md', 'json': '.json', 'yaml': '.yaml',
-        'html': '.html', 'text': '.txt', 'doctags': '.doctags',
-        'vtt': '.vtt', 'doclang': '.doclang',
-    }
-    ext = ext_map.get(args.to, '.md') if args.to else '.md'
-    output_file = output_dir / (input_file.stem + ext)
-    return str(output_file)
+    directory = Path(args.output) if args.output else input_file.parent
+    return str(directory / (input_file.stem + EXTENSIONS[args.to]))
+
+
+def _validate_artifacts(input_file, args, page_count):
+    from docling_core.types.doc import DoclingDocument
+    requested = Path(_extract_output_path(input_file, args))
+    structural = Path(args.output) / (input_file.stem + '.json')
+    artifacts = list(dict.fromkeys([requested, structural]))
+    for path in artifacts:
+        if not path.is_file() or path.stat().st_size == 0:
+            raise ValueError(f'缺少输出或输出为空：{path.name}')
+    doc = DoclingDocument.model_validate_json(structural.read_text(encoding='utf-8'))
+    if len(doc.pages) != page_count:
+        raise ValueError(f'页面数量不一致：输入 {page_count} 页，结构输出 {len(doc.pages)} 页。')
+    if args.to == 'chunks':
+        for line in requested.read_text(encoding='utf-8').splitlines():
+            if line.strip():
+                json.loads(line)
+    elif args.to == 'yaml':
+        import yaml
+        DoclingDocument.model_validate(yaml.safe_load(requested.read_text(encoding='utf-8')))
+    warnings = []
+    if not any(item.text.strip() for item in doc.texts) and not doc.tables:
+        warnings.append('未提取到正文或表格，请检查空白页、OCR 和图片内容。')
+    return artifacts, dict(pages=len(doc.pages), text_items=len(doc.texts),
+                          tables=len(doc.tables), pictures=len(doc.pictures)), warnings
+
+
+def run_conversion(input_file: Path, args) -> dict:
+    start = time.monotonic()
+    report = dict(success=False, input=str(input_file), output_directory=None,
+                  artifacts=[], analysis=None, warnings=[], error=None, elapsed_seconds=0.0)
+    password = getattr(args, 'pdf_password', None)
+    def redact(value):
+        text = str(value)
+        return text.replace(password, '<REDACTED>') if password else text
+    try:
+        input_file = verify_file(str(input_file))
+        report['input'] = str(input_file)
+        analysis = detect_pdf_type(input_file, getattr(args, 'sample_pages', 7), password)
+        report['analysis'] = analysis
+        report['warnings'].extend(analysis['warnings'])
+        if analysis['error']:
+            raise ValueError(analysis['error'])
+        effective = copy.copy(args)
+        # 用户显式指定的 OCR 和表格选项优先于检测建议。
+        if not effective.no_ocr and not effective.force_ocr:
+            effective.no_ocr = '--no-ocr' in analysis['recommended_flags']
+            effective.force_ocr = '--force-ocr' in analysis['recommended_flags']
+        if not effective.tables and not effective.no_tables:
+            effective.tables = True
+        build_docling_cmd(input_file, effective)  # 创建输出目录之前检查参数冲突。
+        if getattr(args, 'timeout', 600) <= 0:
+            raise ValueError('超时秒数必须大于 0。')
+        version = importlib.metadata.version('docling')
+        report['docling_version'] = version
+        if version != '2.115.0':
+            report['warnings'].append(f'当前 Docling {version}；本技能已验证版本为 2.115.0。')
+        parent = verify_dir(str(args.output or input_file.parent))
+        # 每次创建独立目录，旧文件不能进入本次成功判定，也不覆盖既有结果。
+        effective.output = tempfile.mkdtemp(prefix=input_file.stem + '_docling_', dir=parent)
+        report['output_directory'] = effective.output
+        cmd = build_docling_cmd(input_file, effective)
+        report['command'] = [redact(item) for item in cmd]
+        result = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8',
+                                errors='replace', timeout=getattr(args, 'timeout', 600))
+        report['exit_code'] = result.returncode
+        diagnostics = redact((result.stdout or '') + '\n' + (result.stderr or ''))
+        log_path = Path(effective.output) / 'conversion.log'
+        log_path.write_text(diagnostics, encoding='utf-8')
+        report['log'] = str(log_path)
+        if result.returncode != 0:
+            raise ValueError(f'Docling 退出码 {result.returncode}；详情见 {log_path}')
+        if re.search(r'warning|error|exception|failed', result.stderr or '', re.IGNORECASE):
+            report['warnings'].append('Docling 日志包含警告或错误，完整内容保存在 conversion.log。')
+        artifacts, quality, warnings = _validate_artifacts(input_file, effective, analysis['page_count'])
+        report['quality'] = quality
+        report['warnings'].extend(warnings)
+        report['artifacts'] = [dict(path=str(path), bytes=path.stat().st_size) for path in artifacts]
+        report['success'] = True
+    except subprocess.TimeoutExpired as exc:
+        report['error'] = f'转换超时（{getattr(args, "timeout", 600)} 秒）。'
+        if report['output_directory']:
+            chunks = []
+            for value in (exc.stdout, exc.stderr):
+                if value:
+                    chunks.append(value.decode('utf-8', errors='replace') if isinstance(value, bytes) else value)
+            log_path = Path(report['output_directory']) / 'conversion.log'
+            log_path.write_text(redact('\n'.join(chunks)), encoding='utf-8')
+            report['log'] = str(log_path)
+    except importlib.metadata.PackageNotFoundError:
+        report['error'] = '当前 Python 环境没有 Docling；安装技能目录下的 requirements.txt。'
+    except Exception as exc:
+        report['error'] = redact(f'{type(exc).__name__}: {exc}')
+    report['elapsed_seconds'] = round(time.monotonic() - start, 3)
+    # 密码不进入分析、命令、诊断或报告文件。
+    if report['analysis'] and report['analysis']['error']:
+        report['analysis']['error'] = redact(report['analysis']['error'])
+    if report['output_directory']:
+        path = Path(report['output_directory']) / 'conversion-report.json'
+        path.write_text(format_output(report, True) + '\n', encoding='utf-8')
+    return report
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description='Docling 单文件转换（纯执行器，不做自动检测）'
-    )
-    parser.add_argument('input', help='输入文件路径')
-    parser.add_argument('--to', default='md',
-                        choices=['md', 'json', 'yaml', 'html', 'html_split_page',
-                                 'text', 'doctags', 'vtt', 'doclang', 'chunks'],
-                        help='输出格式（默认 md）')
-    parser.add_argument('--output', '-o', help='输出目录（默认当前目录）')
-    parser.add_argument('--from', dest='from_fmt', help='指定输入格式')
-
-    # PDF 选项
-    pdf_group = parser.add_argument_group('PDF options')
-    pdf_group.add_argument('--no-ocr', action='store_true', help='禁用 OCR')
-    pdf_group.add_argument('--force-ocr', action='store_true', help='强制 OCR')
-    pdf_group.add_argument('--tables', action='store_true', help='启用表格结构提取')
-    pdf_group.add_argument('--no-tables', action='store_true', help='禁用表格结构提取')
-    pdf_group.add_argument('--enrich-formula', action='store_true', help='启用公式识别')
-    pdf_group.add_argument('--enrich-code', action='store_true', help='启用代码块识别')
-    pdf_group.add_argument('--enrich-chart-data', action='store_true', help='启用图表数据提取')
-    pdf_group.add_argument('--ocr-lang', help='OCR 语言（如 zh,en）')
-    pdf_group.add_argument('--ocr-engine', help='OCR 引擎（tesseract/easyocr/rapidocr）')
-    pdf_group.add_argument('--pdf-password', help='PDF 密码')
-    pdf_group.add_argument('--table-mode', choices=['fast', 'accurate'], help='表格模式')
-
-    # VLM 选项
-    vlm_group = parser.add_argument_group('VLM options')
-    vlm_group.add_argument('--pipeline', choices=['standard', 'vlm', 'asr'],
-                           help='处理管线')
-    vlm_group.add_argument('--vlm-model', help='VLM 模型名称')
-
+    sys.stdout.reconfigure(encoding='utf-8')
+    sys.stderr.reconfigure(encoding='utf-8')
+    parser = argparse.ArgumentParser(description='仅转换一个本地 PDF：自动分析并验证输出')
+    parser.add_argument('input', help='单个本地 PDF 路径')
+    parser.add_argument('--to', default='md', choices=list(EXTENSIONS))
+    parser.add_argument('--output', '-o', help='输出父目录；默认 PDF 所在目录，每次创建独立子目录')
+    parser.add_argument('--json', action='store_true', help='以 JSON 输出转换报告')
+    parser.add_argument('--sample-pages', type=int, default=7)
+    parser.add_argument('--timeout', type=float, default=600)
+    ocr = parser.add_mutually_exclusive_group()
+    ocr.add_argument('--no-ocr', action='store_true')
+    ocr.add_argument('--force-ocr', action='store_true')
+    tables = parser.add_mutually_exclusive_group()
+    tables.add_argument('--tables', action='store_true')
+    tables.add_argument('--no-tables', action='store_true')
+    parser.add_argument('--enrich-formula', action='store_true')
+    parser.add_argument('--enrich-code', action='store_true')
+    parser.add_argument('--enrich-chart-extraction', '--enrich-chart-data', dest='enrich_chart_data', action='store_true')
+    parser.add_argument('--ocr-engine', default='auto', choices=['auto', 'rapidocr', 'easyocr', 'tesseract', 'tesseract_cli'])
+    parser.add_argument('--ocr-lang', help='所选 OCR 引擎的语言代码；auto 引擎不接受语言覆盖')
+    parser.add_argument('--pdf-password', help='PDF 密码；建议使用环境变量 DOCLING_PDF_PASSWORD')
+    parser.add_argument('--table-mode', choices=['fast', 'accurate'])
     args = parser.parse_args()
-
-    # 验证输入
-    input_file = verify_file(args.input)
-
-    # 验证输出目录
-    if args.output:
-        verify_dir(args.output)
-
-    # 执行转换
-    success, output_path, error, elapsed = run_conversion(input_file, args)
-    print_result(str(input_file), success, elapsed, output_path, error)
-    sys.exit(0 if success else 1)
+    if args.pdf_password is None:
+        args.pdf_password = os.environ.get('DOCLING_PDF_PASSWORD')
+    report = run_conversion(Path(args.input), args)
+    print(format_output(report, args.json))
+    return 0 if report['success'] else 1
 
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main())

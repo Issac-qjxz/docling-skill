@@ -1,0 +1,4 @@
+interface:
+  display_name: "Docling 单 PDF 转换"
+  short_description: "将单个 PDF 转为 Markdown 或结构化数据，自动分析并验证实际产物"
+  default_prompt: "使用 $docling 将一个本地 PDF 转为 Markdown，验证产物并报告实际文件路径。"
